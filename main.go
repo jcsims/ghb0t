@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -26,6 +27,7 @@ const (
 var (
 	token    string
 	interval string
+	baseURL  string
 
 	lastChecked time.Time
 
@@ -37,6 +39,7 @@ func init() {
 	// parse flags
 	flag.StringVar(&token, "token", "", "GitHub API token")
 	flag.StringVar(&interval, "interval", "30s", "check interval (ex. 5ms, 10s, 1m, 3h)")
+	flag.StringVar(&baseURL, "baseURL", "", "Base URL to target, for Githb Enterprise")
 
 	flag.BoolVar(&version, "version", false, "print version and exit")
 	flag.BoolVar(&version, "v", false, "print version and exit (shorthand)")
@@ -62,10 +65,19 @@ func init() {
 	if token == "" {
 		usageAndExit("GitHub token cannot be empty.", 1)
 	}
+
+	// github package expects a URL that ends in a slash
+	if baseURL != "" {
+		if !strings.HasSuffix(baseURL, "/") {
+			baseURL += string("/")
+		}
+	}
 }
 
 func main() {
 	var ticker *time.Ticker
+	var client *github.Client
+	ctx := context.Background()
 	// On ^C, or SIGTERM handle exit.
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
@@ -84,12 +96,21 @@ func main() {
 	)
 	tc := oauth2.NewClient(oauth2.NoContext, ts)
 
+	logrus.Info("About to create the client")
 	// Create the github client.
-	client := github.NewClient(tc)
+	if baseURL != "" {
+		var err error
+		client, err = github.NewEnterpriseClient(baseURL, baseURL, tc)
+		if err != nil {
+			logrus.Fatal(err)
+		}
+	} else {
+		client = github.NewClient(tc)
+	}
 
 	// Get the authenticated user, the empty string being passed let's the GitHub
 	// API know we want ourself.
-	user, _, err := client.Users.Get("")
+	user, _, err := client.Users.Get(ctx, "")
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -107,14 +128,14 @@ func main() {
 	for range ticker.C {
 		page := 1
 		perPage := 20
-		if err := getNotifications(client, username, page, perPage); err != nil {
+		if err := getNotifications(ctx, client, username, page, perPage); err != nil {
 			logrus.Warn(err)
 		}
 	}
 }
 
 // getNotifications iterates over all the notifications received by a user.
-func getNotifications(client *github.Client, username string, page, perPage int) error {
+func getNotifications(ctx context.Context, client *github.Client, username string, page, perPage int) error {
 	opt := &github.NotificationListOptions{
 		All:   true,
 		Since: lastChecked,
@@ -127,14 +148,14 @@ func getNotifications(client *github.Client, username string, page, perPage int)
 		lastChecked = time.Now()
 	}
 
-	notifications, resp, err := client.Activity.ListNotifications(opt)
+	notifications, resp, err := client.Activity.ListNotifications(ctx, opt)
 	if err != nil {
 		return err
 	}
 
 	for _, notification := range notifications {
 		// handle event
-		if err := handleNotification(client, notification, username); err != nil {
+		if err := handleNotification(ctx, client, notification, username); err != nil {
 			return err
 		}
 	}
@@ -145,10 +166,10 @@ func getNotifications(client *github.Client, username string, page, perPage int)
 	}
 
 	page = resp.NextPage
-	return getNotifications(client, username, page, perPage)
+	return getNotifications(ctx, client, username, page, perPage)
 }
 
-func handleNotification(client *github.Client, notification *github.Notification, username string) error {
+func handleNotification(ctx context.Context, client *github.Client, notification *github.Notification, username string) error {
 	// Check if the type is a pull request.
 	if *notification.Subject.Type == "PullRequest" {
 		// Let's get some information about the pull request.
@@ -159,7 +180,7 @@ func handleNotification(client *github.Client, notification *github.Notification
 			return err
 		}
 
-		pr, _, err := client.PullRequests.Get(*notification.Repository.Owner.Login, *notification.Repository.Name, int(id))
+		pr, _, err := client.PullRequests.Get(ctx, *notification.Repository.Owner.Login, *notification.Repository.Name, int(id))
 		if err != nil {
 			return err
 		}
@@ -177,7 +198,7 @@ func handleNotification(client *github.Client, notification *github.Notification
 			owner := *pr.Head.Repo.Owner.Login
 			// Never delete the master branch or a branch we do not own.
 			if owner == username && branch != "master" {
-				_, err := client.Git.DeleteRef(username, *pr.Head.Repo.Name, strings.Replace("heads/"+*pr.Head.Ref, "#", "%23", -1))
+				_, err := client.Git.DeleteRef(ctx, username, *pr.Head.Repo.Name, strings.Replace("heads/"+*pr.Head.Ref, "#", "%23", -1))
 				// 422 is the error code for when the branch does not exist.
 				if err != nil && !strings.Contains(err.Error(), " 422 ") {
 					return err
