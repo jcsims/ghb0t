@@ -96,7 +96,6 @@ func main() {
 	)
 	tc := oauth2.NewClient(oauth2.NoContext, ts)
 
-	logrus.Info("About to create the client")
 	// Create the github client.
 	if baseURL != "" {
 		var err error
